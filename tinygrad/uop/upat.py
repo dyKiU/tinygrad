@@ -1,7 +1,6 @@
 from typing import Any, Callable
 import itertools, inspect, functools, types
 from tinygrad.helpers import partition, dedup, Context
-from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UPat, UOp, Ops, GroupOp, PatternMatcher, graph_rewrite, deconstruct_function
 
 class UPatCompileError(Exception): pass
@@ -125,7 +124,9 @@ pm_renderer = PatternMatcher([
 ], compiled=False)
 
 def _final_render(x:UOp, has_ctx:bool, depth=1) -> list[str]:
-  if x.op is Ops.CUSTOMI and x.arg == "True": x = UOp(Ops.AND, dtypes.bool)
+  if x.op is Ops.CUSTOMI and x.arg == "True":
+    store_clause = "ctx=ctx" if has_ctx else ""
+    return [f"{'  '*depth}if (_ret:=_fxn({store_clause})) is not None: return _ret"]
   assert x.op is Ops.AND
   and_pieces, store_pieces = [], []
   or_pieces: list[str] = []

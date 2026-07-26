@@ -318,7 +318,7 @@ def parse_valid(v:UOp) -> tuple[UOp, bool, int]|None:
   return None
 
 @functools.cache
-def uop_given_valid(valid:UOp, uop:UOp, try_simplex=False) -> UOp:
+def uop_given_valid(valid:UOp, uop:UOp, try_simplex=True) -> UOp:
   # return simplified uop (might be the same as input)
   if valid.op is Ops.CONST: return uop
 

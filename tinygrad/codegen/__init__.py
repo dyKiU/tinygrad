@@ -312,6 +312,9 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = memory_coalescing(sink, ren)
   sink = graph_rewrite(sink, symbolic_simple+ew_devectorizer+pm_simplify_add_image, name="add images", ctx=({}, ren), bottom_up=True)
 
+  # extra symbolic before decomp. crashes without this?
+  sink = graph_rewrite(sink, sym, name="extra symbolic")
+
   # lower index dtype
   # NOTE: we need indexing_simplify to remove the cast to long using the Invalid
   sink = graph_rewrite(sink, pm_lower_index_dtype+indexing_simplify, ctx={}, name="lower all index dtypes")

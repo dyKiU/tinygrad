@@ -1700,7 +1700,7 @@ class RewriteContext:
     stack: list[tuple[UOp, int, UOp]] = [(root, 0, root)]
     on_stack = {root}  # all UOps either on the stack or in self.replace, i.e. dont have to be placed again
     waitlist: dict[UOp, list[tuple[UOp, int, UOp]]] = {}  # UOps waiting on a dependency to be in self.replace
-    replace, ctx, stack_limit, enter_calls, shared_cache = self.replace, self.ctx, REWRITE_STACK_LIMIT.value, self.enter_calls, self.shared_cache
+    replace, ctx, stack_limit, shared_cache = self.replace, self.ctx, REWRITE_STACK_LIMIT.value, self.shared_cache
     bpm, cached_bpm_rewrite = self.bpm, self.cached_bpm_rewrite
     pm_rewrite = self.pm.rewrite if self.pm is not None else None
     while stack:

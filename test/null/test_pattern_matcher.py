@@ -1,9 +1,17 @@
 import unittest, itertools
 from tinygrad.dtype import dtypes
+from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, GroupOp # noqa: F401
 from tinygrad.uop.ops import PatternMatcher, UPat
+from tinygrad.uop.upat import upat_compile
 
 class TestPatternMatcher(unittest.TestCase):
+  def test_unconditional_root_spec(self):
+    u = UOp.const(dtypes.int, 1)
+    with Context(SPEC=2):
+      match = upat_compile(UPat(Ops.CONST), lambda: True)
+    self.assertIs(match(u, None), True)
+
   def test_simple_match(self):
     matcher = PatternMatcher([(UPat(Ops.CONST, name="x", dtype=dtypes.float), lambda x: x.rtag())])
     c1 = UOp.const(dtypes.float, 1.0)
