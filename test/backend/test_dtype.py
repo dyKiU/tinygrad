@@ -215,6 +215,13 @@ class TestBFloat16DTypeCast(unittest.TestCase):
 
 class TestHalfDType(TestDType): DTYPE = dtypes.half
 
+class TestHalfCastRounding(unittest.TestCase):
+  def test_float_to_half_rounding_not_elided(self):
+    x = Tensor([65536.0, -65536.0, 1.0006, -0.0], dtype=dtypes.float32).realize()
+    out = x.cast(dtypes.half).tolist()
+    self.assertEqual(out[:3], [float("inf"), float("-inf"), 1.0009765625])
+    self.assertEqual(math.copysign(1.0, out[3]), -1.0)
+
 class TestEmulatedHalf(TestHalfDType):
   @classmethod
   def setUpClass(cls):
