@@ -210,6 +210,13 @@ class TestBFloat16DTypeCast(unittest.TestCase):
     converted = random_values.cast(dtypes.bfloat16).cast(dtypes.float32)
     np.testing.assert_allclose(converted.numpy(), random_values.cast(dtypes.float32).numpy(), rtol=1e-2, atol=1e-3)
 
+class TestWeakDType(unittest.TestCase):
+  def test_strong_division_commits_computed_weak_denominator(self):
+    with Context(DEFAULT_FLOAT=dtypes.float16):
+      numerator = Tensor.zeros(1, dtype=dtypes.float32).sum()
+      denominator = Tensor.zeros(1, dtype=dtypes.bool).sum() + 1e-5
+      self.assertEqual((numerator / denominator).item(), 0.0)
+
 class TestHalfDType(TestDType): DTYPE = dtypes.half
 
 class TestEmulatedHalf(TestHalfDType):
