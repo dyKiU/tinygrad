@@ -244,22 +244,36 @@ def transform_to_call(big_sink:UOp) -> tuple[UOp, dict[UOp, UOp]]:
 
 # *** all in scope Tensors are here. this gets relevant UOps ***
 
+def _view_base(u:UOp) -> UOp:
+  while not u.has_buffer_identity() and u.op in GroupOp.Movement|{Ops.BITCAST, Ops.DETACH}: u = u.src[0]
+  return u
+
+def _views_through(u:UOp, base:UOp) -> bool:
+  # aliases can stack view ops on top of base (e.g. RESHAPE(BUFFER) when base is BUFFER), so walk through buffer-identity nodes too
+  while u is not base and u.op in GroupOp.Movement|{Ops.BITCAST, Ops.DETACH}: u = u.src[0]
+  return u is base
+
 all_tensors: dict[weakref.ref[Tensor], None] = {}
-def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str) -> None:
+def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, alias_base:UOp|None=None, invert:bool=False,
+                          skip:tuple["Tensor", ...]=()) -> list["Tensor"]:
   with cpu_profile(TracingKey(name), "TINY"):
-    # get tensors in scope
+    # get tensors in scope. with alias_base, only tensors viewing through it (or with invert, only tensors NOT viewing through it)
     in_scope: dict[UOp, bool] = {}
     def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
-    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and not any(t is s for s in skip) and
+                                  (alias_base is None or _views_through(t.uop, alias_base) != invert) and t.uop.topovisit(visitor, in_scope)]
 
     # get all Tensors and apply the map. always walk: replace exactly the nodes the map names, values are final
     sink = UOp.sink(*[t.uop for t in scope_tensors])
     new_sink = sink.substitute(applied_map, name=f"substitute {name}", walk=True)
 
     # set the relevant uop to the realized UOps
+    changed: list[Tensor] = []
     for t,s,ns in zip(scope_tensors, sink.src, new_sink.src):
       if s is ns: continue
       t.uop = ns
+      changed.append(t)
+    return changed
 
 # **** Tensor helper functions ****
 
@@ -453,11 +467,16 @@ class Tensor(RandMixin):
       return self
     # STORE+AFTER: STORE is the write effect (void), AFTER wraps the view for correct shape/ranging
     assign = self.uop.after(self.uop.store(x.uop))
-    ib = self.uop
-    while not ib.has_buffer_identity() and ib.op in GroupOp.Movement|{Ops.BITCAST, Ops.DETACH}: ib = ib.src[0]
+    ib = _view_base(self.uop)
     if ib is not self.uop and ib.has_buffer_identity(after_ok=True):
+      # prior readers (non-alias tensors reading this buffer) must keep the value they captured no matter when they
+      # realize: repoint them at a snapshot copy of the buffer. the source x is left alone: its read of the buffer
+      # happens inside the store's own kernel, before the write
+      readers = _apply_map_to_tensors({ib: (snap:=ib.clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True, skip=(x,))
       # view assign: replace at the buffer-identity level (e.g. RESHAPE(BUFFER)) so @function's substitution catches it
-      _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign")
+      _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign", alias_base=ib)
+      # the snapshot graph only references the pre-assign chain, so this can't schedule the new write
+      if readers: Tensor(snap).realize()
     else:
       # simple assign
       self.uop = assign
