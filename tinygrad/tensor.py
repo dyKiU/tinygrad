@@ -253,7 +253,24 @@ def _views_through(u:UOp, base:UOp) -> bool:
   while u is not base and u.op in GroupOp.Movement|{Ops.BITCAST, Ops.DETACH}: u = u.src[0]
   return u is base
 
+def _storage_range(u:UOp, base:UOp) -> tuple[UOp, int, int]|None:
+  if not _views_through(u, base) or not all_int(u.shape) or (cv:=u.contiguous_view()) is None: return None
+  root, offset = cv
+  byte_offset = offset * root.element_size()
+  return root, byte_offset, byte_offset + int(u.numel()) * u.element_size()
+
+def _reader_overlaps(u:UOp, base:UOp, write_range:tuple[UOp, int, int]|None) -> bool:
+  if write_range is None: return True
+  views = [s for x in u.toposort() if not _views_through(x, base) for s in x.src if _views_through(s, base)]
+  if not views: return True
+  for view in views:
+    if (read_range:=_storage_range(view, base)) is None or read_range[0] is not write_range[0]: return True
+    if read_range[1] < write_range[2] and write_range[1] < read_range[2]: return True
+  return False
+
 all_tensors: dict[weakref.ref[Tensor], None] = {}
+_snapshot_grad_owners: weakref.WeakKeyDictionary[UOp, tuple[weakref.ref[Tensor], ...]] = weakref.WeakKeyDictionary()
+
 def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, alias_base:UOp|None=None, invert:bool=False,
                           skip:tuple["Tensor", ...]=()) -> list["Tensor"]:
   with cpu_profile(TracingKey(name), "TINY"):
@@ -274,6 +291,12 @@ def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, alias_base:UOp|N
       t.uop = ns
       changed.append(t)
     return changed
+
+def _live_alias_assign_sources(big_sink:UOp) -> tuple[UOp, ...]:
+  """Keep a live assignment source only when it reads the storage being assigned."""
+  store_sources = {u.src[1] for u in big_sink.toposort() if u.op is Ops.STORE and _view_base(u.src[0]) in u.src[1].toposort()}
+  return tuple(t.uop for tref in list(all_tensors) if (t:=tref()) is not None and t.uop in store_sources and
+               not t.uop.has_buffer_identity() and t.uop not in big_sink.src)
 
 # **** Tensor helper functions ****
 
@@ -420,7 +443,9 @@ class Tensor(RandMixin):
     # weakness ends where storage begins
     if any(t.dtype in dtypes.weaks and t.uop.device is not None for t in (self,)+lst):
       raise RuntimeError("cannot realize a weak dtype; cast to a concrete dtype first")
-    big_sink, becomes_map = transform_to_call(UOp.sink(*[x.uop for x in (self,)+lst]))
+    big_sink = UOp.sink(*[x.uop for x in (self,)+lst])
+    big_sink = UOp.sink(*big_sink.src, *_live_alias_assign_sources(big_sink))
+    big_sink, becomes_map = transform_to_call(big_sink)
     _apply_map_to_tensors(becomes_map, name="buffers")
     return create_linear_with_vars(big_sink)
 
@@ -469,16 +494,35 @@ class Tensor(RandMixin):
     assign = self.uop.after(self.uop.store(x.uop))
     ib = _view_base(self.uop)
     if ib is not self.uop and ib.has_buffer_identity(after_ok=True):
+      prior_readers = [t for tref in list(all_tensors) if (t:=tref()) is not None and not _views_through(t.uop, ib) and ib in t.uop.toposort()]
+      write_range = _storage_range(self.uop, ib)
+      disjoint_readers = tuple(t for t in prior_readers if not _reader_overlaps(t.uop, ib, write_range))
+      # remember aliases before their public graphs move to the post-assign state. if a differentiable reader uses one,
+      # its corresponding snapshot node remains the gradient target for that Tensor.
+      grad_owners = [(tref, t.uop) for tref in list(all_tensors) if (t:=tref()) is not None and _views_through(t.uop, ib)]
+      for tref, old_uop in grad_owners:
+        _snapshot_grad_owners[old_uop] = _snapshot_grad_owners.get(old_uop, ())+(tref,)
       # prior readers (non-alias tensors reading this buffer) must keep the value they captured no matter when they
-      # realize: repoint them at a snapshot copy of the buffer. the source x is left alone: its read of the buffer
-      # happens inside the store's own kernel, before the write
-      readers = _apply_map_to_tensors({ib: (snap:=ib.clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True, skip=(x,))
+      # realize: repoint overlapping readers at a snapshot copy. disjoint contiguous readers can use the original buffer.
+      readers = _apply_map_to_tensors({ib: (snap:=ib.clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True,
+                                      skip=(x,)+disjoint_readers)
       # view assign: replace at the buffer-identity level (e.g. RESHAPE(BUFFER)) so @function's substitution catches it
       _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign", alias_base=ib)
       # the snapshot graph only references the pre-assign chain, so this can't schedule the new write
-      if readers: Tensor(snap).realize()
+      from tinygrad.engine.realize import capturing
+      if readers:
+        realized_snap = Tensor(snap).realize().uop
+        for tref, old_uop in grad_owners:
+          snapshot_uop = old_uop.substitute({ib: realized_snap}, name="snapshot gradient target", walk=True)
+          _snapshot_grad_owners[snapshot_uop] = _snapshot_grad_owners.get(snapshot_uop, ())+(tref,)
+        # A captured reader must carry the write effect so TinyJit replay retains the mutation.
+        if capturing:
+          for reader in readers:
+            reader.uop = reader.uop.substitute({realized_snap: realized_snap.after(assign)}, name="Attach View Assign", walk=True)
+      if capturing:
+        for reader in disjoint_readers:
+          reader.uop = reader.uop.substitute({ib: ib.after(assign)}, name="Attach Disjoint View Assign", walk=True)
     else:
-      # simple assign
       self.uop = assign
     return self
 
@@ -684,15 +728,27 @@ class Tensor(RandMixin):
     ```
     """
     all_uops = self.uop.toposort()
-    # backward fills .grad for every in-scope float tensor with a device
-    tensors_need_grad: list[Tensor] = [t for tref in all_tensors if (t:=tref()) is not None and \
-                                       t.uop in all_uops and t.is_floating_point() and t.device is not None]
+    # Map each graph target to the live Tensors that own its gradient. Assign snapshots use a historical graph target
+    # whose gradient still belongs to the Tensor that now exposes the post-assign state.
+    target_owners: dict[UOp, list[Tensor]] = {}
+    def add_owner(target:UOp, owner:Tensor) -> None:
+      if owner.is_floating_point() and owner.device is not None and not any(owner is x for x in target_owners.setdefault(target, [])):
+        target_owners[target].append(owner)
+    for tref in all_tensors:
+      if (t:=tref()) is not None and t.uop in all_uops: add_owner(t.uop, t)
+    for target in all_uops:
+      for tref in _snapshot_grad_owners.get(target, ()):
+        if (t:=tref()) is not None: add_owner(target, t)
+    targets = list(target_owners)
+    gradient_targets = [owners[0] if owners[0].uop is target else Tensor(target) for target,owners in target_owners.items()]
     # clear contexts
-    for t,g in zip(tensors_need_grad, self.gradient(*tensors_need_grad, gradient=gradient)):
-      assert g.shape == t.shape, f"grad shape must match tensor shape, {g.shape!r} != {t.shape!r}"
-      if g.device is None: g = g.clone(device=t.device)
-      if t.grad is None: t.grad = g
-      else: t.grad.assign(t.grad + g.to(t.grad.device))
+    for target,g in zip(targets, self.gradient(*gradient_targets, gradient=gradient)):
+      for i,t in enumerate(target_owners[target]):
+        owner_grad = g if i == 0 else Tensor(g.uop)
+        assert owner_grad.shape == t.shape, f"grad shape must match tensor shape, {owner_grad.shape!r} != {t.shape!r}"
+        if owner_grad.device is None: owner_grad = owner_grad.clone(device=t.device)
+        if t.grad is None: t.grad = owner_grad
+        else: t.grad.assign(t.grad + owner_grad.to(t.grad.device))
     return self
 
   # ***** movement ops *****
