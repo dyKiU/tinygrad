@@ -384,10 +384,46 @@ class TestAssign(unittest.TestCase):
       x[:1].assign(Tensor([9], device=x.device, dtype=dtypes.int))
       return reader.realize()
 
-    for _ in range(4):
-      x = Tensor([1, 2], dtype=dtypes.int).contiguous().realize()
-      self.assertEqual(f(x).tolist(), [11, 12])
-      self.assertEqual(x.tolist(), [9, 2])
+    for i in range(4):
+      x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
+      self.assertEqual(f(x).tolist(), [i+11, i+12])
+      self.assertEqual(x.tolist(), [9, i+2])
+
+  def test_assign_view_prior_reader_is_jit_rhs(self):
+    @TinyJit
+    def f(x:Tensor):
+      reader = x[:1] + 10
+      x[:1].assign(reader)
+      return reader
+
+    for i in range(4):
+      x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
+      self.assertEqual(f(x).tolist(), [i+11])
+      self.assertEqual(x.tolist(), [i+11, i+2])
+
+  def test_assign_view_realized_prior_reader_jit_replay(self):
+    @TinyJit
+    def f(x:Tensor):
+      reader = (x + 10).realize()
+      x[:1].assign(Tensor([9], device=x.device, dtype=dtypes.int))
+      return reader
+
+    for i in range(4):
+      x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
+      self.assertEqual(f(x).tolist(), [i+11, i+12])
+      self.assertEqual(x.tolist(), [9, i+2])
+
+  def test_assign_view_realized_disjoint_reader_jit_replay(self):
+    @TinyJit
+    def f(x:Tensor):
+      reader = (x[:1] + 10).realize()
+      x[-1:].assign(Tensor([9], device=x.device, dtype=dtypes.int))
+      return reader
+
+    for i in range(4):
+      x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
+      self.assertEqual(f(x).tolist(), [i+11])
+      self.assertEqual(x.tolist(), [i+1, 9])
 
   def test_assign_view_disjoint_reader_stays_lazy(self):
     x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
@@ -406,6 +442,22 @@ class TestAssign(unittest.TestCase):
       Tensor.realize(w2, w1) if reverse else Tensor.realize(w1, w2)
       self.assertEqual(x.tolist(), [2, 1])
 
+  @unittest.expectedFailure
+  def test_assign_view_alias_below_identity_level_sees_write(self):
+    x = Tensor([[1, 2], [3, 4]], dtype=dtypes.int).contiguous().realize()
+    flat = Tensor(x.uop.base)
+    x[0:1, 0:1].assign(Tensor([[9]], dtype=dtypes.int))
+    self.assertEqual(flat.tolist(), [9, 2, 3, 4])
+
+  @unittest.expectedFailure
+  def test_assign_simple_then_view_assign_through_alias(self):
+    x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
+    y = x.reshape(2, 2)
+    x.assign(Tensor([5, 6, 7, 8], dtype=dtypes.int))
+    w = y[0:1, 0:1].assign(Tensor([[9]], dtype=dtypes.int))
+    Tensor.realize(x, w)
+    self.assertEqual(x.tolist(), [9, 6, 7, 8])
+
   def test_assign_view_backward_prior_loss(self):
     w = Tensor([1.0, 2.0]).contiguous().realize()
     loss = (w * w).sum()
@@ -413,6 +465,22 @@ class TestAssign(unittest.TestCase):
     loss.backward()
     self.assertEqual(loss.item(), 5.0)
     self.assertEqual(w.grad.tolist() if w.grad is not None else None, [2.0, 4.0])
+
+  def test_assign_full_view_backward_prior_loss(self):
+    w = Tensor([1.0, 2.0]).contiguous().realize()
+    loss = (w * w).sum()
+    w[:].assign(Tensor([5.0, 6.0]))
+    loss.backward()
+    self.assertEqual(loss.item(), 5.0)
+    self.assertEqual(w.grad.tolist() if w.grad is not None else None, [2.0, 4.0])
+
+  def test_assign_view_prior_loss_owner_replaced(self):
+    w = Tensor([1.0, 2.0]).contiguous().realize()
+    loss = (w * w).sum()
+    w[:1].assign(Tensor([5.0]))
+    w.replace(Tensor([100.0, 200.0]).realize())
+    loss.backward()
+    self.assertIsNone(w.grad)
 
   def test_assign_bitcast_view_realize_without_touching_base(self):
     x = Tensor([1.0, 2.0, 3.0, 4.0], dtype=dtypes.float32).realize()
