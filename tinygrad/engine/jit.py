@@ -224,17 +224,8 @@ class _TinyJit(Generic[ReturnType]):
     self.captured: CapturedJit|None = captured
     self.cnt: int = 2 if self.fxn is None else 0
     self.prune = prune
-    self._effects: dict[UOp, tuple[Tensor, int]] = {}
 
   def add_linear(self, linear:UOp, var_vals:dict[str, int]): self._linears.append(linear)
-  def add_effect(self, effect:Tensor):
-    base = effect.uop.buf_uop
-    self._effects[base] = (effect, self._effects.get(base, (effect, 0))[1]+1)
-  def remove_effects(self, sink:UOp):
-    store_counts: dict[UOp, int] = {}
-    for u in sink.toposort():
-      if u.op is Ops.STORE: store_counts[u.src[0].buf_uop] = store_counts.get(u.src[0].buf_uop, 0)+1
-    self._effects = {base:effect for base,effect in self._effects.items() if store_counts.get(base, 0) < effect[1]}
 
   def reset(self):
     assert self.fxn is not None, "can't reset without function"
@@ -261,15 +252,14 @@ class _TinyJit(Generic[ReturnType]):
       assert self.fxn is not None
       if capturing: raise RuntimeError(f"having TinyJit inside another TinyJit is not supported {len(capturing)=} {capturing=}")
       self._linears: list[UOp] = []
-      self._effects = {}
       capturing.append(self)
       try:
         ret = self.fxn(*args, **kwargs)
-        effects = [effect for effect,_ in self._effects.values()]
-        if len(params:=get_parameters(ret))+len(effects): Tensor.realize(*params, *effects)
-      finally: capturing.clear()
-      del self._effects
-      del effects
+        if len(params:=get_parameters(ret)): Tensor.realize(*params)
+        Tensor._flush_capture_effects()
+      finally:
+        capturing.clear()
+        Tensor._clear_capture_effects()
       if not len(self._linears): raise JitError("didn't JIT anything!")
       _check_no_non_tensor_return(ret)
       if DEBUG >= 1: print(f"JIT captured {len(self._linears)} linears with {len(input_buf_uops)} inputs")

@@ -425,6 +425,16 @@ class TestAssign(unittest.TestCase):
       self.assertEqual(f(x).tolist(), [i+11])
       self.assertEqual(x.tolist(), [i+1, 9])
 
+  def test_assign_view_effect_only_jit_replay(self):
+    @TinyJit
+    def f(x:Tensor):
+      x[:1].assign(Tensor([9], device=x.device, dtype=dtypes.int))
+
+    for i in range(4):
+      x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
+      self.assertIsNone(f(x))
+      self.assertEqual(x.tolist(), [9, i+2])
+
   def test_assign_view_disjoint_reader_stays_lazy(self):
     x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
     reader = x[:1] + 10
@@ -467,18 +477,29 @@ class TestAssign(unittest.TestCase):
     self.assertEqual(w.grad.tolist() if w.grad is not None else None, [2.0, 4.0])
 
   def test_assign_full_view_backward_prior_loss(self):
-    w = Tensor([1.0, 2.0]).contiguous().realize()
-    loss = (w * w).sum()
-    w[:].assign(Tensor([5.0, 6.0]))
-    loss.backward()
-    self.assertEqual(loss.item(), 5.0)
-    self.assertEqual(w.grad.tolist() if w.grad is not None else None, [2.0, 4.0])
+    for realize_first in (False, True):
+      w = Tensor([1.0, 2.0]).contiguous().realize()
+      loss = (w * w).sum()
+      w[:].assign(Tensor([5.0, 6.0]))
+      if realize_first: w.realize()
+      loss.backward()
+      if not realize_first: w.realize()
+      self.assertEqual(loss.item(), 5.0)
+      self.assertEqual(w.grad.tolist() if w.grad is not None else None, [2.0, 4.0])
 
   def test_assign_view_prior_loss_owner_replaced(self):
     w = Tensor([1.0, 2.0]).contiguous().realize()
     loss = (w * w).sum()
     w[:1].assign(Tensor([5.0]))
     w.replace(Tensor([100.0, 200.0]).realize())
+    loss.backward()
+    self.assertIsNone(w.grad)
+
+  def test_assign_view_prior_loss_owner_replaced_with_dependency(self):
+    w = Tensor([1.0, 2.0]).contiguous().realize()
+    loss = (w * w).sum()
+    w[:1].assign(Tensor([5.0]))
+    w.replace(w + 100)
     loss.backward()
     self.assertIsNone(w.grad)
 

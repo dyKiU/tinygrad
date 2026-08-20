@@ -268,13 +268,16 @@ def _reader_overlaps(nodes:dict[UOp, None], base:UOp, write_range:tuple[UOp, int
     if read_range[1] < write_range[2] and write_range[1] < read_range[2]: return True
   return False
 
-all_tensors: dict[weakref.ref[Tensor], None] = {}
-_snapshot_grad_owners: weakref.WeakKeyDictionary[UOp, tuple[tuple[weakref.ref[Tensor], weakref.ref[UOp]], ...]] = weakref.WeakKeyDictionary()
+all_tensors: dict[weakref.ref[Tensor], int] = {}
+_identity_views: dict[weakref.ref[Tensor], None] = {}
+_snapshot_grad_owners: weakref.WeakKeyDictionary[UOp, tuple[tuple[weakref.ref[Tensor], int], ...]] = weakref.WeakKeyDictionary()
+_capture_effects: dict[UOp, Tensor] = {}
 
-def _add_snapshot_grad_owner(target:UOp, owner:weakref.ref[Tensor], base:UOp) -> None:
+def _add_snapshot_grad_owner(target:UOp, owner:weakref.ref[Tensor]) -> None:
   owners = _snapshot_grad_owners.get(target, ())
-  if any(tref() is owner() and base_ref() is base for tref,base_ref in owners): return
-  _snapshot_grad_owners[target] = owners+((owner, weakref.ref(base)),)
+  version = all_tensors[owner]
+  if any(tref() is owner() and owner_version == version for tref,owner_version in owners): return
+  _snapshot_grad_owners[target] = owners+((owner, version),)
 
 def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, alias_base:UOp|None=None, invert:bool=False,
                           skip:tuple["Tensor", ...]=()) -> list["Tensor"]:
@@ -369,10 +372,12 @@ class Tensor(RandMixin):
     if _dtype is not None: self.uop = self.uop.cast(_dtype)
 
     # add to all_tensors after construction succeeds
-    all_tensors[weakref.ref(self)] = None
+    all_tensors[weakref.ref(self)] = 0
 
   @suppress_finalizing
-  def __del__(self): all_tensors.pop(weakref.ref(self), None)
+  def __del__(self):
+    all_tensors.pop(weakref.ref(self), None)
+    _identity_views.pop(weakref.ref(self), None)
 
   def _apply_uop(self, fxn:Callable[..., UOp], *x:Tensor, **kwargs) -> Tensor:
     srcs = (self,)+x
@@ -382,7 +387,14 @@ class Tensor(RandMixin):
     ret = Tensor.__new__(Tensor)
     ret.uop, ret.grad, ret.is_param = new_uop, None, True
     # add to all_tensors after construction succeeds
-    all_tensors[weakref.ref(ret)] = None
+    all_tensors[weakref.ref(ret)] = 0
+    return ret
+
+  def __getitem__(self, indices) -> Tensor:
+    ret = super().__getitem__(indices)
+    if ret is self:
+      ret = Tensor(self.uop)
+      _identity_views[weakref.ref(ret)] = None
     return ret
 
   # alu, _uop, _wrap_uop and const are used by the mixins
@@ -450,8 +462,6 @@ class Tensor(RandMixin):
     if any(t.dtype in dtypes.weaks and t.uop.device is not None for t in (self,)+lst):
       raise RuntimeError("cannot realize a weak dtype; cast to a concrete dtype first")
     big_sink = UOp.sink(*[x.uop for x in (self,)+lst])
-    from tinygrad.engine.realize import capturing
-    if capturing: capturing[0].remove_effects(big_sink)
     big_sink = UOp.sink(*big_sink.src, *_live_alias_assign_sources(big_sink))
     big_sink, becomes_map = transform_to_call(big_sink)
     _apply_map_to_tensors(becomes_map, name="buffers")
@@ -466,10 +476,20 @@ class Tensor(RandMixin):
   @disable_gc()
   def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:
     """Triggers the computation needed to create these Tensor(s)."""
-    to_realize = [x for x in (self,)+lst if not x.uop.is_virtual and not x.uop.has_buffer_identity()]
+    from tinygrad.engine.realize import capturing
+    effects = tuple(_capture_effects.values()) if capturing else ()
+    to_realize = [x for x in (self,)+lst+effects if not x.uop.is_virtual and not x.uop.has_buffer_identity()]
     if len(to_realize):
       run_linear(*Tensor.linear_with_vars(*to_realize), update_stats=do_update_stats)
+    if effects: _capture_effects.clear()
     return self
+
+  @staticmethod
+  def _clear_capture_effects(): _capture_effects.clear()
+
+  @staticmethod
+  def _flush_capture_effects():
+    if _capture_effects: next(iter(_capture_effects.values())).realize()
 
   def replace(self, x:Tensor) -> Tensor:
     """
@@ -477,6 +497,7 @@ class Tensor(RandMixin):
     """
     # used for replacing a Tensor with a new version of it (potentially with a different device and dtype)
     assert self.shape == x.shape, f"replace shape mismatch {self.shape} != {x.shape}"
+    all_tensors[weakref.ref(self)] += 1
     self.uop = x.uop
     return self
 
@@ -501,8 +522,8 @@ class Tensor(RandMixin):
     # STORE+AFTER: STORE is the write effect (void), AFTER wraps the view for correct shape/ranging
     assign = self.uop.after(self.uop.store(x.uop))
     ib = _view_base(self.uop)
-    if ib.has_buffer_identity(after_ok=True):
-      from tinygrad.engine.realize import capturing
+    is_view_assign = ib is not self.uop or weakref.ref(self) in _identity_views
+    if is_view_assign and ib.has_buffer_identity(after_ok=True):
       live_tensors = [(tref, t) for tref in list(all_tensors) if (t:=tref()) is not None]
       reader_graphs = [(t, nodes) for _,t in live_tensors if not _views_through(t.uop, ib) and ib in (nodes:=t.uop.toposort())]
       write_range = _storage_range(self.uop, ib)
@@ -512,28 +533,25 @@ class Tensor(RandMixin):
       reader_nodes = {u for _,nodes in reader_graphs for u in nodes}
       grad_owners = [(tref, t.uop) for tref,t in live_tensors if t.is_floating_point() and t.device is not None and
                      _views_through(t.uop, ib) and t.uop in reader_nodes]
-      for tref, old_uop in grad_owners: _add_snapshot_grad_owner(old_uop, tref, ib)
+      for tref, old_uop in grad_owners: _add_snapshot_grad_owner(old_uop, tref)
       # prior readers (non-alias tensors reading this buffer) must keep the value they captured no matter when they
       # realize: repoint overlapping readers at a snapshot copy. disjoint contiguous readers can use the original buffer.
       overlapping_readers = [t for t,_ in reader_graphs if t is not x and not any(t is d for d in disjoint_readers)]
-      if overlapping_readers and (ib is not self.uop or capturing):
+      if overlapping_readers:
         readers = _apply_map_to_tensors({ib: (snap:=ib.clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True,
                                         skip=(x,)+disjoint_readers)
       else: readers = []
-      if ib is not self.uop:
-        # view assign: replace at the buffer-identity level (e.g. RESHAPE(BUFFER)) so @function's substitution catches it
-        _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign", alias_base=ib)
-      else: self.uop = assign
+      _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign", alias_base=ib)
       # the snapshot graph only references the pre-assign chain, so this can't schedule the new write
       if readers:
         realized_snap = Tensor(snap).realize().uop
         for tref, old_uop in grad_owners:
           snapshot_uop = old_uop.substitute({ib: realized_snap}, name="snapshot gradient target", walk=True)
-          _add_snapshot_grad_owner(snapshot_uop, tref, ib)
-      # A returned reader may be realized already or may also be the assignment source, so capture the write itself.
-      if capturing: capturing[0].add_effect(Tensor(assign))
+          _add_snapshot_grad_owner(snapshot_uop, tref)
     else:
       self.uop = assign
+    from tinygrad.engine.realize import capturing
+    if capturing and ib.has_buffer_identity(after_ok=True): _capture_effects[self.uop.buf_uop] = Tensor(self.uop)
     return self
 
   def _buffer(self) -> Buffer:
@@ -757,8 +775,8 @@ class Tensor(RandMixin):
     for tref in all_tensors:
       if (t:=tref()) is not None and t.uop in all_uops: add_owner(t.uop, t)
     for target,owners in historical_owners.items():
-      for tref,base_ref in owners:
-        if (t:=tref()) is not None and (base:=base_ref()) is not None and base in t.uop.toposort(): add_owner(target, t)
+      for tref,owner_version in owners:
+        if (t:=tref()) is not None and all_tensors.get(tref) == owner_version: add_owner(target, t)
     targets = list(target_owners)
     gradient_targets = [owners[0] if owners[0].uop is target else Tensor(target) for target,owners in target_owners.items()]
     # clear contexts
