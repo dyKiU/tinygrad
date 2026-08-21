@@ -392,9 +392,7 @@ class Tensor(RandMixin):
 
   def __getitem__(self, indices) -> Tensor:
     ret = super().__getitem__(indices)
-    if ret is self:
-      ret = Tensor(self.uop)
-      _identity_views[weakref.ref(ret)] = None
+    if ret is self: _identity_views[weakref.ref(self)] = None
     return ret
 
   # alu, _uop, _wrap_uop and const are used by the mixins
@@ -522,7 +520,9 @@ class Tensor(RandMixin):
     # STORE+AFTER: STORE is the write effect (void), AFTER wraps the view for correct shape/ranging
     assign = self.uop.after(self.uop.store(x.uop))
     ib = _view_base(self.uop)
-    is_view_assign = ib is not self.uop or weakref.ref(self) in _identity_views
+    self_ref = weakref.ref(self)
+    is_view_assign = ib is not self.uop or self_ref in _identity_views
+    _identity_views.pop(self_ref, None)
     if is_view_assign and ib.has_buffer_identity(after_ok=True):
       live_tensors = [(tref, t) for tref in list(all_tensors) if (t:=tref()) is not None]
       reader_graphs = [(t, nodes) for _,t in live_tensors if not _views_through(t.uop, ib) and ib in (nodes:=t.uop.toposort())]
