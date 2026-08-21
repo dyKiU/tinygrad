@@ -1,0 +1,61 @@
+name: View Assign Stress Tests
+env:
+  CACHE_VERSION: '19'
+  PYTHONPATH: ${{ github.workspace }}
+  CHECK_OOB: 1
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'tinygrad/tensor.py'
+      - 'tinygrad/engine/jit.py'
+      - 'tinygrad/engine/realize.py'
+      - 'tinygrad/engine/schedule.py'
+      - 'tinygrad/uop/ops.py'
+      - 'test/unit/test_assign.py'
+      - 'extra/view_assign_stress_*.py'
+      - '.github/workflows/view_assign_stress.yml'
+  pull_request:
+    paths:
+      - 'tinygrad/tensor.py'
+      - 'tinygrad/engine/jit.py'
+      - 'tinygrad/engine/realize.py'
+      - 'tinygrad/engine/schedule.py'
+      - 'tinygrad/uop/ops.py'
+      - 'test/unit/test_assign.py'
+      - 'extra/view_assign_stress_*.py'
+      - '.github/workflows/view_assign_stress.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: view-assign-stress-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  view-assign-stress:
+    name: View Assign Stress Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      - name: Setup Environment
+        uses: ./.github/actions/setup-tinygrad
+        with:
+          python-version: '3.11'
+          deps: testing_unit
+      - name: Stress graph ordering
+        run: DEV=CPU python3 extra/view_assign_stress_graph.py
+      - name: Stress backward and gradient ownership
+        run: DEV=CPU python3 extra/view_assign_stress_backward.py
+      - name: Stress TinyJit effects
+        run: DEV=CPU python3 extra/view_assign_stress_jit.py
+      - name: Stress chained assignment ordering
+        run: DEV=CPU python3 extra/view_assign_stress_ordering.py
+      - name: Measure view assign bookkeeping
+        run: DEV=CPU python3 extra/view_assign_stress_perf.py
