@@ -433,6 +433,35 @@ class TestAssign(unittest.TestCase):
     self.assertEqual(reader.tolist(), [11])
     self.assertEqual(x.tolist(), [1, 2, 3, 9])
 
+  def _count_storage_range(self, fxn):
+    # _storage_range runs a full graph_rewrite (via UOp.contiguous_view), so it dominates assign cost
+    import tinygrad.tensor as tensor_module
+    calls, orig = [], tensor_module._storage_range
+    def counting(u, base):
+      calls.append(u)
+      return orig(u, base)
+    tensor_module._storage_range = counting
+    try: fxn()
+    finally: tensor_module._storage_range = orig
+    return len(calls)
+
+  def test_assign_view_no_readers_skips_write_range(self):
+    # the write range only decides which prior readers overlap the write. with no prior readers there is
+    # nothing to decide, and computing it anyway made chained view assigns quadratic in chain length
+    x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
+    n = self._count_storage_range(lambda: x[:1].assign(Tensor([9], dtype=dtypes.int)))
+    self.assertEqual(n, 0, "view assign with no prior readers must not compute the write range")
+    self.assertEqual(x.tolist(), [9, 2, 3, 4])
+
+  def test_assign_view_with_reader_still_checks_overlap(self):
+    # guard the other way: skipping the write range when readers DO exist would lose overlap detection
+    x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
+    reader = x[:1] + 10
+    n = self._count_storage_range(lambda: x[-1:].assign(Tensor([9], dtype=dtypes.int)))
+    self.assertGreater(n, 0, "with a prior reader the write range is needed to classify overlap")
+    self.assertEqual(reader.tolist(), [11])
+    self.assertEqual(x.tolist(), [1, 2, 3, 9])
+
   def test_assign_view_swap_regions(self):
     for reverse in (False, True):
       x = Tensor([1, 2], dtype=dtypes.int).contiguous().realize()

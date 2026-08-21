@@ -523,7 +523,8 @@ class Tensor(RandMixin):
     if is_view_assign and ib.has_buffer_identity(after_ok=True):
       live_tensors = [(tref, t) for tref in list(all_tensors) if (t:=tref()) is not None]
       reader_graphs = [(t, nodes) for _,t in live_tensors if not _views_through(t.uop, ib) and ib in (nodes:=t.uop.toposort())]
-      write_range = _storage_range(self.uop, ib)
+      # _storage_range runs a graph_rewrite over the whole AFTER chain, so only pay it when a reader needs classifying
+      write_range = _storage_range(self.uop, ib) if reader_graphs else None
       disjoint_readers = tuple(t for t,nodes in reader_graphs if not _reader_overlaps(nodes, ib, write_range))
       # remember aliases before their public graphs move to the post-assign state. if a differentiable reader uses one,
       # its corresponding snapshot node remains the gradient target for that Tensor.
