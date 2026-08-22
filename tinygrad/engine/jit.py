@@ -249,7 +249,6 @@ class _TinyJit(Generic[ReturnType]):
       try:
         ret = self.fxn(*args, **kwargs)
         if len(params:=get_parameters(ret)): Tensor.realize(*params)
-        Tensor._flush_capture_effects()
       finally:
         capturing.clear()
         Tensor._clear_capture_effects()

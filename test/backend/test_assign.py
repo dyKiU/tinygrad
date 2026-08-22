@@ -414,10 +414,10 @@ class TestAssign(unittest.TestCase):
       self.assertEqual(f(x).tolist(), [i+11])
       self.assertEqual(x.tolist(), [i+1, 9])
 
-  def test_assign_view_effect_only_jit_replay(self):
+  def test_assign_view_explicit_effect_jit_replay(self):
     @TinyJit
     def f(x:Tensor):
-      x[:1].assign(Tensor([9], device=x.device, dtype=dtypes.int))
+      x[:1].assign(Tensor([9], device=x.device, dtype=dtypes.int)).realize()
 
     for i in range(4):
       x = Tensor([i+1, i+2], dtype=dtypes.int).contiguous().realize()
@@ -432,6 +432,16 @@ class TestAssign(unittest.TestCase):
     assert_kernel_count(0)
     self.assertEqual(reader.tolist(), [11])
     self.assertEqual(x.tolist(), [1, 2, 3, 9])
+
+  def test_assign_view_overlapping_reader_stays_lazy(self):
+    x = Tensor([1, 2, 3, 4], dtype=dtypes.int).contiguous().realize()
+    reader = x + 10
+    value = Tensor([9], dtype=dtypes.int)
+    GlobalCounters.reset()
+    x[:1].assign(value)
+    assert_kernel_count(0)
+    self.assertEqual(reader.tolist(), [11, 12, 13, 14])
+    self.assertEqual(x.tolist(), [9, 2, 3, 4])
 
   def _count_storage_range(self, fxn):
     # _storage_range runs a full graph_rewrite (via UOp.contiguous_view), so it dominates assign cost

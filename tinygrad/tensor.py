@@ -261,6 +261,7 @@ def _reader_overlaps(nodes:dict[UOp, None], base:UOp, write_range:tuple[UOp, int
 all_tensors: dict[weakref.ref[Tensor], int] = {}
 _identity_views: dict[weakref.ref[Tensor], None] = {}
 _snapshot_grad_owners: weakref.WeakKeyDictionary[UOp, tuple[tuple[weakref.ref[Tensor], int], ...]] = weakref.WeakKeyDictionary()
+_assign_snapshots: weakref.WeakKeyDictionary[UOp, UOp] = weakref.WeakKeyDictionary()
 _capture_effects: dict[UOp, Tensor] = {}
 
 def _add_snapshot_grad_owner(target:UOp, owner:weakref.ref[Tensor]) -> None:
@@ -268,6 +269,14 @@ def _add_snapshot_grad_owner(target:UOp, owner:weakref.ref[Tensor]) -> None:
   version = all_tensors[owner]
   if any(tref() is owner() and owner_version == version for tref,owner_version in owners): return
   _snapshot_grad_owners[target] = owners+((owner, version),)
+
+def _transfer_snapshot_metadata(applied_map:dict[UOp, UOp]) -> None:
+  for target,replacement in applied_map.items():
+    if not (owners:=_snapshot_grad_owners.get(target)): continue
+    existing = _snapshot_grad_owners.get(replacement, ())
+    _snapshot_grad_owners[replacement] = existing+tuple(owner for owner in owners if owner not in existing)
+  for assign,snapshot in list(_assign_snapshots.items()):
+    if (new_snapshot:=applied_map.get(snapshot)) is not None: _assign_snapshots[assign] = new_snapshot
 
 def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, alias_base:UOp|None=None, invert:bool=False,
                           skip:tuple["Tensor", ...]=()) -> list["Tensor"]:
@@ -298,6 +307,9 @@ def _live_alias_assign_sources(big_sink:UOp) -> tuple[UOp, ...]:
                not t.uop.has_buffer_identity() and t.uop not in big_sink.src)
 
 def _tensor_holds(u:UOp) -> bool: return any((t:=tref()) is not None and t.uop is u for tref in list(all_tensors))
+
+def _live_assign_snapshots(big_sink:UOp) -> tuple[UOp, ...]:
+  return tuple(snapshot for u in big_sink.toposort() if (snapshot:=_assign_snapshots.get(u)) is not None)
 
 # **** Tensor helper functions ****
 
@@ -442,7 +454,9 @@ class Tensor(RandMixin):
   def callify(self, *lst:Tensor) -> Tensor:
     big_sink = UOp.sink(*[x.uop for x in (self,)+lst])
     big_sink, buffer_map = transform_to_call(big_sink)
-    _apply_map_to_tensors({x:y.after(big_sink) for x,y in buffer_map.items()}, name="callify")
+    applied_map = {x:y.after(big_sink) for x,y in buffer_map.items()}
+    _transfer_snapshot_metadata(applied_map)
+    _apply_map_to_tensors(applied_map, name="callify")
     return self
 
   def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
@@ -452,7 +466,10 @@ class Tensor(RandMixin):
       raise RuntimeError("cannot realize a weak dtype; cast to a concrete dtype first")
     big_sink = UOp.sink(*[x.uop for x in (self,)+lst])
     big_sink = UOp.sink(*big_sink.src, *_live_alias_assign_sources(big_sink))
+    # snapshots are separate roots so WAR scheduling orders their reads before the corresponding writes
+    big_sink = UOp.sink(*big_sink.src, *_live_assign_snapshots(big_sink))
     big_sink, becomes_map = transform_to_call(big_sink)
+    _transfer_snapshot_metadata(becomes_map)
     _apply_map_to_tensors(becomes_map, name="buffers")
     return create_linear_with_vars(big_sink)
 
@@ -475,10 +492,6 @@ class Tensor(RandMixin):
 
   @staticmethod
   def _clear_capture_effects(): _capture_effects.clear()
-
-  @staticmethod
-  def _flush_capture_effects():
-    if _capture_effects: next(iter(_capture_effects.values())).realize()
 
   def replace(self, x:Tensor) -> Tensor:
     """
@@ -536,15 +549,14 @@ class Tensor(RandMixin):
       # realize: repoint overlapping readers at a snapshot copy. disjoint contiguous readers can use the original buffer.
       overlapping_readers = [t for t,_ in reader_graphs if t is not x and not any(t is d for d in disjoint_readers)]
       if overlapping_readers:
-        readers = _apply_map_to_tensors({ib: (snap:=ib.clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True,
+        readers = _apply_map_to_tensors({ib: (snap:=ib.detach().clone())}, name="Snapshot Prior Readers", alias_base=ib, invert=True,
                                         skip=(x,)+disjoint_readers)
+        _assign_snapshots[assign] = snap
       else: readers = []
       _apply_map_to_tensors({ib: ib.after(assign)}, name="Embed View Assign", alias_base=ib)
-      # the snapshot graph only references the pre-assign chain, so this can't schedule the new write
       if readers:
-        realized_snap = Tensor(snap).realize().uop
         for tref, old_uop in grad_owners:
-          snapshot_uop = old_uop.substitute({ib: realized_snap}, name="snapshot gradient target", walk=True)
+          snapshot_uop = old_uop.substitute({ib: snap}, name="snapshot gradient target", walk=True)
           _add_snapshot_grad_owner(snapshot_uop, tref)
     else:
       self.uop = assign
