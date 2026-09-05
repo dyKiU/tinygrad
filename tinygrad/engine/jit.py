@@ -249,7 +249,9 @@ class _TinyJit(Generic[ReturnType]):
       try:
         ret = self.fxn(*args, **kwargs)
         if len(params:=get_parameters(ret)): Tensor.realize(*params)
-      finally: capturing.clear()
+      finally:
+        capturing.clear()
+        Tensor._clear_capture_effects()
       if not len(self._linears): raise JitError("didn't JIT anything!")
       _check_no_non_tensor_return(ret)
       if DEBUG >= 1: print(f"JIT captured {len(self._linears)} linears with {len(input_buf_uops)} inputs")
