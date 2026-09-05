@@ -533,7 +533,7 @@ class Tensor(RandMixin):
     self_ref = weakref.ref(self)
     is_view_assign = ib is not self.uop or self_ref in _identity_views
     _identity_views.pop(self_ref, None)
-    if is_view_assign and ib.has_buffer_identity(after_ok=True):
+    if is_view_assign and (ib.has_buffer_identity(after_ok=True) or ib.op is Ops.CONTIGUOUS):
       live_tensors = [(tref, t) for tref in list(all_tensors) if (t:=tref()) is not None]
       reader_graphs = [(t, nodes) for _,t in live_tensors if not _views_through(t.uop, ib) and ib in (nodes:=t.uop.toposort())]
       # _storage_range runs a graph_rewrite over the whole AFTER chain, so only pay it when a reader needs classifying
@@ -561,7 +561,7 @@ class Tensor(RandMixin):
     else:
       self.uop = assign
     from tinygrad.engine.realize import capturing
-    if capturing and ib.has_buffer_identity(after_ok=True): _capture_effects[self.uop.buf_uop] = Tensor(self.uop)
+    if capturing and (ib.has_buffer_identity(after_ok=True) or ib.op is Ops.CONTIGUOUS): _capture_effects[self.uop.buf_uop] = Tensor(self.uop)
     return self
 
   def _buffer(self) -> Buffer:
